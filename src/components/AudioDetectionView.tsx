@@ -16,6 +16,7 @@ import type {
   AudioAnalysisResult,
   DetectionRecord,
 } from "../types/forensics";
+import { postForensicForm } from "../utils/apiClient";
 import { createSampleAudioFile, decodeAudioPeaks } from "../utils/mediaTools";
 import { downloadForensicReport } from "../utils/reportExport";
 import { formatBytes, formatDuration } from "../utils/storage";
@@ -207,17 +208,10 @@ export default function AudioDetectionView({
       formData.append("durationSec", String(durationSec || audioRef.current?.duration || 6));
       formData.append("threshold", String(settings.aiThresholdPercent));
 
-      const response = await fetch("/api/analyze/audio", {
-        method: "POST",
-        body: formData,
-      });
-
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.error || "Audio forensic analysis failed.");
-      }
-
-      const analysis = payload as AudioAnalysisResult;
+      const analysis = await postForensicForm<AudioAnalysisResult>(
+        "/api/analyze/audio",
+        formData
+      );
       const elapsed = Math.round(performance.now() - startTime);
       setResult(analysis);
 

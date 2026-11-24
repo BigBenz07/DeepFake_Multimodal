@@ -1,5 +1,5 @@
 import "dotenv/config";
-import express, { type Request, type Response } from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
 import multer from "multer";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -70,6 +70,18 @@ function deriveVerdict(
 ): "AI-Generated" | "Authentic" | "Inconclusive" {
   if (Math.abs(aiPct - threshold) <= 6) return "Inconclusive";
   return aiPct >= threshold ? "AI-Generated" : "Authentic";
+}
+
+function parseGeminiJson(raw: string | undefined): Record<string, unknown> {
+  const cleaned = (raw ?? "")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  if (!cleaned) {
+    throw new Error("The forensic model returned an empty response. Please try again.");
+  }
+  return JSON.parse(cleaned) as Record<string, unknown>;
 }
 
 function parseApiError(err: unknown): { status: number; message: string } {
@@ -227,8 +239,8 @@ Provide realistic calibrated probabilities (aiGeneratedPercent from 0 to 100), c
           })
         );
 
-        const rawText = (response.text ?? "").trim();
-        const parsed = JSON.parse(rawText);
+        const parsed = parseGeminiJson(response.text);
+        const signals = (parsed.signals ?? {}) as Record<string, unknown>;
 
         const aiGeneratedPercent = clamp(Number(parsed.aiGeneratedPercent), 0, 100);
         const authenticPercent = 100 - aiGeneratedPercent;
@@ -262,10 +274,10 @@ Provide realistic calibrated probabilities (aiGeneratedPercent from 0 to 100), c
               }))
             : [],
           signals: {
-            lightingConsistency: clamp(Number(parsed.signals?.lightingConsistency ?? 50), 0, 100),
-            textureNaturalness: clamp(Number(parsed.signals?.textureNaturalness ?? 50), 0, 100),
-            edgeCoherence: clamp(Number(parsed.signals?.edgeCoherence ?? 50), 0, 100),
-            compressionIntegrity: clamp(Number(parsed.signals?.compressionIntegrity ?? 50), 0, 100),
+            lightingConsistency: clamp(Number(signals.lightingConsistency ?? 50), 0, 100),
+            textureNaturalness: clamp(Number(signals.textureNaturalness ?? 50), 0, 100),
+            edgeCoherence: clamp(Number(signals.edgeCoherence ?? 50), 0, 100),
+            compressionIntegrity: clamp(Number(signals.compressionIntegrity ?? 50), 0, 100),
           },
         };
 
@@ -385,7 +397,8 @@ Divide the ${durationSec.toFixed(1)}s timeline into 5 to 8 consecutive non-overl
           })
         );
 
-        const parsed = JSON.parse((response.text ?? "").trim());
+        const parsed = parseGeminiJson(response.text);
+        const signals = (parsed.signals ?? {}) as Record<string, unknown>;
         const aiGeneratedPercent = clamp(Number(parsed.aiGeneratedPercent), 0, 100);
         const authenticPercent = 100 - aiGeneratedPercent;
         const confidenceScore = clamp(Number(parsed.confidenceScore), 40, 99);
@@ -430,10 +443,10 @@ Divide the ${durationSec.toFixed(1)}s timeline into 5 to 8 consecutive non-overl
               }))
             : [],
           signals: {
-            prosodyNaturalness: clamp(Number(parsed.signals?.prosodyNaturalness ?? 50), 0, 100),
-            spectralContinuity: clamp(Number(parsed.signals?.spectralContinuity ?? 50), 0, 100),
-            breathingPatterns: clamp(Number(parsed.signals?.breathingPatterns ?? 50), 0, 100),
-            noiseFloorConsistency: clamp(Number(parsed.signals?.noiseFloorConsistency ?? 50), 0, 100),
+            prosodyNaturalness: clamp(Number(signals.prosodyNaturalness ?? 50), 0, 100),
+            spectralContinuity: clamp(Number(signals.spectralContinuity ?? 50), 0, 100),
+            breathingPatterns: clamp(Number(signals.breathingPatterns ?? 50), 0, 100),
+            noiseFloorConsistency: clamp(Number(signals.noiseFloorConsistency ?? 50), 0, 100),
           },
         });
       } catch (err) {
@@ -572,7 +585,8 @@ Return an entry in frameAnalyses for EVERY frame index from 0 to ${files.length 
           })
         );
 
-        const parsed = JSON.parse((response.text ?? "").trim());
+        const parsed = parseGeminiJson(response.text);
+        const signals = (parsed.signals ?? {}) as Record<string, unknown>;
         const aiGeneratedPercent = clamp(Number(parsed.aiGeneratedPercent), 0, 100);
         const authenticPercent = 100 - aiGeneratedPercent;
         const confidenceScore = clamp(Number(parsed.confidenceScore), 40, 99);
@@ -580,14 +594,14 @@ Return an entry in frameAnalyses for EVERY frame index from 0 to ${files.length 
         const byIndex = new Map<number, Record<string, unknown>>();
         if (Array.isArray(parsed.frameAnalyses)) {
           for (const item of parsed.frameAnalyses) {
-            const idx = Number(item.frameIndex);
-            if (Number.isInteger(idx)) byIndex.set(idx, item);
+            const idx = Number((item as Record<string, unknown>).frameIndex);
+            if (Number.isInteger(idx)) byIndex.set(idx, item as Record<string, unknown>);
           }
         }
 
         const frameAnalyses = files.map((_, idx) => {
-          const item = byIndex.get(idx) || (Array.isArray(parsed.frameAnalyses) ? parsed.frameAnalyses[idx] : undefined) || {};
-          const prob = clamp(Number((item as Record<string, unknown>).aiProbability ?? aiGeneratedPercent), 0, 100);
+          const item = byIndex.get(idx) || (Array.isArray(parsed.frameAnalyses) ? (parsed.frameAnalyses[idx] as Record<string, unknown>) : undefined) || {};
+          const prob = clamp(Number(item.aiProbability ?? aiGeneratedPercent), 0, 100);
           const status =
             prob >= threshold
               ? "Suspicious"
@@ -597,8 +611,8 @@ Return an entry in frameAnalyses for EVERY frame index from 0 to ${files.length 
           const ts = Number.isFinite(timestamps[idx])
             ? Number(timestamps[idx])
             : Number(((idx * durationSec) / Math.max(1, files.length)).toFixed(2));
-          const rawRegions = Array.isArray((item as Record<string, unknown>).heatmapRegions)
-            ? ((item as Record<string, unknown>).heatmapRegions as Record<string, unknown>[])
+          const rawRegions = Array.isArray(item.heatmapRegions)
+            ? (item.heatmapRegions as Record<string, unknown>[])
             : [];
 
           return {
@@ -606,7 +620,7 @@ Return an entry in frameAnalyses for EVERY frame index from 0 to ${files.length 
             timestampSec: Number(ts.toFixed(2)),
             aiProbability: prob,
             status,
-            note: String((item as Record<string, unknown>).note || "Frame-level spatio-temporal inspection."),
+            note: String(item.note || "Frame-level spatio-temporal inspection."),
             heatmapRegions: rawRegions.slice(0, 4).map((r) => ({
               label: String(r.label || "Frame Region"),
               x: clamp(Number(r.x), 2, 85),
@@ -639,10 +653,10 @@ Return an entry in frameAnalyses for EVERY frame index from 0 to ${files.length 
               }))
             : [],
           signals: {
-            lipSyncCoherence: clamp(Number(parsed.signals?.lipSyncCoherence ?? 50), 0, 100),
-            blinkNaturalness: clamp(Number(parsed.signals?.blinkNaturalness ?? 50), 0, 100),
-            temporalStability: clamp(Number(parsed.signals?.temporalStability ?? 50), 0, 100),
-            lightingContinuity: clamp(Number(parsed.signals?.lightingContinuity ?? 50), 0, 100),
+            lipSyncCoherence: clamp(Number(signals.lipSyncCoherence ?? 50), 0, 100),
+            blinkNaturalness: clamp(Number(signals.blinkNaturalness ?? 50), 0, 100),
+            temporalStability: clamp(Number(signals.temporalStability ?? 50), 0, 100),
+            lightingContinuity: clamp(Number(signals.lightingContinuity ?? 50), 0, 100),
           },
         });
       } catch (err) {
@@ -651,6 +665,33 @@ Return an entry in frameAnalyses for EVERY frame index from 0 to ${files.length 
       }
     }
   );
+
+  // Ensure unmatched /api/* routes always return JSON (never Vite index.html)
+  app.use("/api", (_req: Request, res: Response) => {
+    res.status(404).json({ error: "API endpoint not found." });
+  });
+
+  // Global JSON error handler for Multer upload errors & unexpected Express errors
+  app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    if (err instanceof multer.MulterError) {
+      const msg =
+        err.code === "LIMIT_FILE_SIZE"
+          ? "Uploaded file is too large (max 35 MB)."
+          : `Upload error: ${err.message}`;
+      res.status(400).json({ error: msg });
+      return;
+    }
+    if (req.path.startsWith("/api")) {
+      const { status, message } = parseApiError(err);
+      res.status(status).json({ error: message });
+      return;
+    }
+    next(err);
+  });
 
   // =========================================================
   // VITE MIDDLEWARE (DEV) OR STATIC ASSETS (PROD)

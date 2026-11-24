@@ -16,7 +16,8 @@ import type {
   DetectionRecord,
   ImageAnalysisResult,
 } from "../types/forensics";
-import { createSampleImageFile } from "../utils/mediaTools";
+import { postForensicForm } from "../utils/apiClient";
+import { createSampleImageFile, prepareImageForAnalysis } from "../utils/mediaTools";
 import { downloadForensicReport } from "../utils/reportExport";
 import { formatBytes } from "../utils/storage";
 import PlotlyChart from "./PlotlyChart";
@@ -87,21 +88,15 @@ export default function ImageDetectionView({
     const startTime = performance.now();
 
     try {
+      const uploadFile = await prepareImageForAnalysis(file);
       const formData = new FormData();
-      formData.append("file", file);
+      formData.append("file", uploadFile);
       formData.append("threshold", String(settings.aiThresholdPercent));
 
-      const response = await fetch("/api/analyze/image", {
-        method: "POST",
-        body: formData,
-      });
-
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.error || "Image forensic analysis failed.");
-      }
-
-      const analysis = payload as ImageAnalysisResult;
+      const analysis = await postForensicForm<ImageAnalysisResult>(
+        "/api/analyze/image",
+        formData
+      );
       const elapsed = Math.round(performance.now() - startTime);
       setResult(analysis);
 

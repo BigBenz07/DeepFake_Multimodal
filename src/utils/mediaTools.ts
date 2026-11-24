@@ -12,6 +12,61 @@ export interface VideoExtractionResult {
 }
 
 /**
+ * Optimizes large images (> 900 KB or > 1600px) into a crisp high-quality JPEG
+ * so uploads stay fast and never trigger reverse-proxy payload limits.
+ */
+export async function prepareImageForAnalysis(file: File): Promise<File> {
+  const MAX_BYTES = 900 * 1024;
+  const MAX_DIM = 1600;
+
+  if (file.size <= MAX_BYTES && (file.type === "image/jpeg" || file.type === "image/webp")) {
+    return file;
+  }
+
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("Could not decode image."));
+      el.src = objectUrl;
+    });
+
+    const needsResize = img.naturalWidth > MAX_DIM || img.naturalHeight > MAX_DIM;
+    if (!needsResize && file.size <= MAX_BYTES) {
+      return file;
+    }
+
+    const scale = Math.min(1, MAX_DIM / Math.max(img.naturalWidth || 1, img.naturalHeight || 1));
+    const w = Math.max(64, Math.round(img.naturalWidth * scale));
+    const h = Math.max(64, Math.round(img.naturalHeight * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return file;
+
+    ctx.drawImage(img, 0, 0, w, h);
+
+    const blob = await new Promise<Blob | null>((resolve) => {
+      canvas.toBlob((b) => resolve(b), "image/jpeg", 0.9);
+    });
+
+    if (!blob || blob.size >= file.size) {
+      return file;
+    }
+
+    const baseName = file.name.replace(/\.[^.]+$/, "");
+    return new File([blob], `${baseName}.jpg`, { type: "image/jpeg" });
+  } catch {
+    return file;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+/**
  * Extracts evenly spaced JPEG keyframes from any HTML5-playable video file.
  */
 export async function extractVideoFrames(

@@ -14,6 +14,7 @@ import type {
   DetectionRecord,
   VideoAnalysisResult,
 } from "../types/forensics";
+import { postForensicForm } from "../utils/apiClient";
 import { createSampleVideoFile, extractVideoFrames } from "../utils/mediaTools";
 import { downloadForensicReport } from "../utils/reportExport";
 import { formatBytes, formatDuration } from "../utils/storage";
@@ -109,17 +110,10 @@ export default function VideoDetectionView({
       formData.append("durationSec", String(extracted.durationSec));
       formData.append("threshold", String(settings.aiThresholdPercent));
 
-      const response = await fetch("/api/analyze/video", {
-        method: "POST",
-        body: formData,
-      });
-
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.error || "Video forensic analysis failed.");
-      }
-
-      const rawResult = payload as VideoAnalysisResult;
+      const rawResult = await postForensicForm<VideoAnalysisResult>(
+        "/api/analyze/video",
+        formData
+      );
       const mergedFrames = rawResult.frameAnalyses.map((fa, idx) => ({
         ...fa,
         thumbnailDataUrl: extracted.frames[idx]?.dataUrl,
