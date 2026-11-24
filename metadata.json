@@ -1,0 +1,6 @@
+{
+  "name": "VeriSight AI — Multimodal Deepfake Detection",
+  "description": "Futuristic AI cybersecurity dashboard for multimodal deepfake detection across images, audio, and videos using deep learning forensics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
