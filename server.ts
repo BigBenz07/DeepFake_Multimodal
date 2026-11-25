@@ -1,15 +1,63 @@
 import "dotenv/config";
+import crypto from "crypto";
 import express, { type NextFunction, type Request, type Response } from "express";
 import multer from "multer";
 import path from "path";
 import { fileURLToPath } from "url";
-import { GoogleGenAI, Type, type GenerateContentResponse } from "@google/genai";
+import {
+  GoogleGenAI,
+  ThinkingLevel,
+  Type,
+  type GenerateContentResponse,
+} from "@google/genai";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
-const MODEL_NAME = "gemini-4-hydrogen";
+const PRIMARY_MODEL = "gemini-4-hydrogen";
+const FALLBACK_MODEL = "gemini-3.1-flash-lite";
+const MODEL_CHAIN: Array<{ name: string; thinkingLevel?: ThinkingLevel }> = [
+  { name: PRIMARY_MODEL, thinkingLevel: ThinkingLevel.LOW },
+  { name: FALLBACK_MODEL },
+];
+
+// Tracks temporary per-model rate-limit cooldowns so we skip exhausted models immediately
+const modelCooldownUntil = new Map<string, number>();
+
+// Short-lived SHA-256 result cache so re-analyzing the same file doesn't burn extra quota
+interface CacheEntry {
+  expiresAt: number;
+  payload: unknown;
+}
+const analysisCache = new Map<string, CacheEntry>();
+const CACHE_TTL_MS = 10 * 60 * 1000;
+const CACHE_MAX_ENTRIES = 50;
+
+function getCachedAnalysis(key: string): unknown | null {
+  const entry = analysisCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    analysisCache.delete(key);
+    return null;
+  }
+  return entry.payload;
+}
+
+function setCachedAnalysis(key: string, payload: unknown): void {
+  if (analysisCache.size >= CACHE_MAX_ENTRIES) {
+    const oldestKey = analysisCache.keys().next().value;
+    if (oldestKey) analysisCache.delete(oldestKey);
+  }
+  analysisCache.set(key, { expiresAt: Date.now() + CACHE_TTL_MS, payload });
+}
+
+function hashBuffers(prefix: string, buffers: Buffer[]): string {
+  const h = crypto.createHash("sha256");
+  h.update(prefix);
+  for (const buf of buffers) h.update(buf);
+  return h.digest("hex");
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -36,26 +84,107 @@ function createGeminiClient(): GoogleGenAI {
   });
 }
 
-async function callWithRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+function extractRetrySeconds(msg: string): number | null {
+  const m =
+    msg.match(/retry in\s+(\d+(?:\.\d+)?)s/i) ||
+    msg.match(/"retryDelay"\s*:\s*"(\d+)s"/i);
+  if (!m) return null;
+  const secs = Math.ceil(Number(m[1]));
+  return Number.isFinite(secs) && secs > 0 ? secs : null;
+}
+
+function isRateLimitError(msg: string): boolean {
+  return (
+    msg.includes("429") ||
+    msg.includes("RESOURCE_EXHAUSTED") ||
+    msg.includes("quota")
+  );
+}
+
+function isTransientError(msg: string): boolean {
+  return (
+    msg.includes("503") ||
+    msg.includes("500") ||
+    msg.includes("UNAVAILABLE") ||
+    msg.includes("OVERLOADED") ||
+    isRateLimitError(msg)
+  );
+}
+
+async function generateForensicContent(
+  ai: GoogleGenAI,
+  params: {
+    contents: unknown;
+    systemInstruction: string;
+    responseSchema: Record<string, unknown>;
+  }
+): Promise<GenerateContentResponse> {
+  const now = Date.now();
+  // Prefer models not currently on cooldown; if all are on cooldown, try fallback first
+  const orderedModels = [...MODEL_CHAIN].sort((a, b) => {
+    const coolA = (modelCooldownUntil.get(a.name) ?? 0) > now ? 1 : 0;
+    const coolB = (modelCooldownUntil.get(b.name) ?? 0) > now ? 1 : 0;
+    return coolA - coolB;
+  });
+
   let lastError: unknown;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (err: unknown) {
-      lastError = err;
-      const msg = err instanceof Error ? err.message : String(err);
-      const isTransient =
-        msg.includes("503") ||
-        msg.includes("500") ||
-        msg.includes("429") ||
-        msg.includes("UNAVAILABLE") ||
-        msg.includes("RESOURCE_EXHAUSTED");
-      if (!isTransient || attempt === maxRetries) {
+
+  for (const candidate of orderedModels) {
+    const maxAttempts = candidate.name === FALLBACK_MODEL ? 2 : 1;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const config: Record<string, unknown> = {
+          systemInstruction: params.systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: params.responseSchema,
+        };
+        if (candidate.thinkingLevel) {
+          config.thinkingConfig = { thinkingLevel: candidate.thinkingLevel };
+        }
+
+        const resp = await ai.models.generateContent({
+          model: candidate.name,
+          contents: params.contents as Parameters<typeof ai.models.generateContent>[0]["contents"],
+          config: config as Parameters<typeof ai.models.generateContent>[0]["config"],
+        });
+
+        modelCooldownUntil.delete(candidate.name);
+        return resp;
+      } catch (err: unknown) {
+        lastError = err;
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (isRateLimitError(msg)) {
+          const retrySecs = extractRetrySeconds(msg);
+          const cooldownMs = Math.min(90_000, Math.max(45_000, (retrySecs ?? 60) * 1000));
+          modelCooldownUntil.set(candidate.name, Date.now() + cooldownMs);
+
+          // If this isn't the last model, immediately fall back to the next model
+          if (candidate !== orderedModels[orderedModels.length - 1]) {
+            break;
+          }
+          // On the final fallback model, only retry once if retryDelay is short (<= 6s)
+          if (attempt < maxAttempts - 1 && retrySecs !== null && retrySecs <= 6) {
+            await new Promise((r) => setTimeout(r, retrySecs * 1000));
+            continue;
+          }
+          break;
+        }
+
+        if (isTransientError(msg) && attempt < maxAttempts - 1) {
+          await new Promise((r) => setTimeout(r, 900 * Math.pow(2, attempt)));
+          continue;
+        }
+
+        if (isTransientError(msg)) {
+          break; // try next model in chain
+        }
+
         throw err;
       }
-      await new Promise((r) => setTimeout(r, 900 * Math.pow(2, attempt)));
     }
   }
+
   throw lastError;
 }
 
@@ -96,11 +225,14 @@ function parseApiError(err: unknown): { status: number; message: string } {
         "Gemini API authentication failed. Please verify your API key in Settings > Secrets.",
     };
   }
-  if (raw.includes("RESOURCE_EXHAUSTED") || raw.includes("429")) {
+  if (isRateLimitError(raw)) {
+    const retrySecs = extractRetrySeconds(raw);
+    const waitHint = retrySecs
+      ? ` Please wait ~${retrySecs} seconds and try again`
+      : " Please wait a moment and try again";
     return {
       status: 429,
-      message:
-        "Rate limit reached on the Gemini API. Please wait a moment and try again, or check your quota in Settings > Secrets.",
+      message: `Gemini API rate limit reached across available models.${waitHint}, or select a billing-enabled API key in Settings > Secrets for higher quota.`,
     };
   }
   return {
@@ -116,7 +248,8 @@ async function startServer() {
   app.get("/api/health", (_req: Request, res: Response) => {
     res.json({
       status: "ok",
-      model: MODEL_NAME,
+      model: PRIMARY_MODEL,
+      fallbackModel: FALLBACK_MODEL,
       configured: Boolean(
         process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY"
       ),
@@ -142,102 +275,103 @@ async function startServer() {
         }
 
         const threshold = clamp(Number(req.body?.threshold ?? 50), 10, 90);
+        const cacheKey = hashBuffers(`img:${threshold}:`, [file.buffer]);
+        const cached = getCachedAnalysis(cacheKey);
+        if (cached) {
+          res.json(cached);
+          return;
+        }
+
         const ai = createGeminiClient();
         const base64Data = file.buffer.toString("base64");
 
-        const response: GenerateContentResponse = await callWithRetry(() =>
-          ai.models.generateContent({
-            model: MODEL_NAME,
-            contents: {
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: file.mimetype,
-                    data: base64Data,
-                  },
+        const response: GenerateContentResponse = await generateForensicContent(ai, {
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: file.mimetype,
+                  data: base64Data,
                 },
-                {
-                  text: `Perform a thorough deepfake and AI-generation forensic inspection of this image.
+              },
+              {
+                text: `Perform a thorough deepfake and AI-generation forensic inspection of this image.
 Evaluate visual cues including: skin pore texture vs over-smoothed diffusion sheen, iris/pupil reflections, ear/hairline/finger anatomy, lighting and shadow geometry, background warping, text distortion, and compression/noise consistency.
 Provide realistic calibrated probabilities (aiGeneratedPercent from 0 to 100), confidenceScore (0 to 100), specific forensic artifacts, 4 signal scores (0-100 where higher = more authentic/natural), and 2 to 5 spatial suspiciousRegions with normalized 0-100 coordinates (x, y, width, height) highlighting the exact regions inspected or flagged for heatmap rendering.`,
+              },
+            ],
+          },
+          systemInstruction:
+            "You are an expert digital media forensics neural analyzer specializing in deepfake, GAN, and diffusion-model image detection. Return strictly calibrated, objective JSON forensic data without disclaimers.",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              aiGeneratedPercent: {
+                type: Type.NUMBER,
+                description: "Estimated probability (0-100) that the image is AI-generated or deepfake manipulated.",
+              },
+              confidenceScore: {
+                type: Type.NUMBER,
+                description: "Forensic confidence (0-100) in the determination.",
+              },
+              summary: {
+                type: Type.STRING,
+                description: "Concise 2-3 sentence technical forensic conclusion.",
+              },
+              artifacts: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    category: { type: Type.STRING },
+                    severity: { type: Type.STRING, description: "High, Medium, or Low" },
+                    observation: { type: Type.STRING },
+                  },
+                  required: ["category", "severity", "observation"],
                 },
-              ],
-            },
-            config: {
-              systemInstruction:
-                "You are an expert digital media forensics neural analyzer specializing in deepfake, GAN, and diffusion-model image detection. Return strictly calibrated, objective JSON forensic data without disclaimers.",
-              responseMimeType: "application/json",
-              responseSchema: {
+              },
+              suspiciousRegions: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    label: { type: Type.STRING },
+                    x: { type: Type.NUMBER, description: "Left coordinate 0-90 percent" },
+                    y: { type: Type.NUMBER, description: "Top coordinate 0-90 percent" },
+                    width: { type: Type.NUMBER, description: "Box width 8-60 percent" },
+                    height: { type: Type.NUMBER, description: "Box height 8-60 percent" },
+                    intensity: { type: Type.NUMBER, description: "Suspicion score 0-100" },
+                    reason: { type: Type.STRING },
+                  },
+                  required: ["label", "x", "y", "width", "height", "intensity", "reason"],
+                },
+              },
+              signals: {
                 type: Type.OBJECT,
                 properties: {
-                  aiGeneratedPercent: {
-                    type: Type.NUMBER,
-                    description: "Estimated probability (0-100) that the image is AI-generated or deepfake manipulated.",
-                  },
-                  confidenceScore: {
-                    type: Type.NUMBER,
-                    description: "Forensic confidence (0-100) in the determination.",
-                  },
-                  summary: {
-                    type: Type.STRING,
-                    description: "Concise 2-3 sentence technical forensic conclusion.",
-                  },
-                  artifacts: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        category: { type: Type.STRING },
-                        severity: { type: Type.STRING, description: "High, Medium, or Low" },
-                        observation: { type: Type.STRING },
-                      },
-                      required: ["category", "severity", "observation"],
-                    },
-                  },
-                  suspiciousRegions: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        label: { type: Type.STRING },
-                        x: { type: Type.NUMBER, description: "Left coordinate 0-90 percent" },
-                        y: { type: Type.NUMBER, description: "Top coordinate 0-90 percent" },
-                        width: { type: Type.NUMBER, description: "Box width 8-60 percent" },
-                        height: { type: Type.NUMBER, description: "Box height 8-60 percent" },
-                        intensity: { type: Type.NUMBER, description: "Suspicion score 0-100" },
-                        reason: { type: Type.STRING },
-                      },
-                      required: ["label", "x", "y", "width", "height", "intensity", "reason"],
-                    },
-                  },
-                  signals: {
-                    type: Type.OBJECT,
-                    properties: {
-                      lightingConsistency: { type: Type.NUMBER },
-                      textureNaturalness: { type: Type.NUMBER },
-                      edgeCoherence: { type: Type.NUMBER },
-                      compressionIntegrity: { type: Type.NUMBER },
-                    },
-                    required: [
-                      "lightingConsistency",
-                      "textureNaturalness",
-                      "edgeCoherence",
-                      "compressionIntegrity",
-                    ],
-                  },
+                  lightingConsistency: { type: Type.NUMBER },
+                  textureNaturalness: { type: Type.NUMBER },
+                  edgeCoherence: { type: Type.NUMBER },
+                  compressionIntegrity: { type: Type.NUMBER },
                 },
                 required: [
-                  "aiGeneratedPercent",
-                  "confidenceScore",
-                  "summary",
-                  "artifacts",
-                  "suspiciousRegions",
-                  "signals",
+                  "lightingConsistency",
+                  "textureNaturalness",
+                  "edgeCoherence",
+                  "compressionIntegrity",
                 ],
               },
             },
-          })
-        );
+            required: [
+              "aiGeneratedPercent",
+              "confidenceScore",
+              "summary",
+              "artifacts",
+              "suspiciousRegions",
+              "signals",
+            ],
+          },
+        });
 
         const parsed = parseGeminiJson(response.text);
         const signals = (parsed.signals ?? {}) as Record<string, unknown>;
@@ -281,6 +415,7 @@ Provide realistic calibrated probabilities (aiGeneratedPercent from 0 to 100), c
           },
         };
 
+        setCachedAnalysis(cacheKey, result);
         res.json(result);
       } catch (err) {
         const { status, message } = parseApiError(err);
@@ -309,93 +444,94 @@ Provide realistic calibrated probabilities (aiGeneratedPercent from 0 to 100), c
 
         const durationSec = Math.max(1, Number(req.body?.durationSec) || 10);
         const threshold = clamp(Number(req.body?.threshold ?? 50), 10, 90);
+        const cacheKey = hashBuffers(`aud:${threshold}:${durationSec.toFixed(1)}:`, [file.buffer]);
+        const cached = getCachedAnalysis(cacheKey);
+        if (cached) {
+          res.json(cached);
+          return;
+        }
+
         const ai = createGeminiClient();
         const base64Data = file.buffer.toString("base64");
         const normalizedMime = file.mimetype === "video/webm" ? "audio/webm" : file.mimetype;
 
-        const response: GenerateContentResponse = await callWithRetry(() =>
-          ai.models.generateContent({
-            model: MODEL_NAME,
-            contents: {
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: normalizedMime,
-                    data: base64Data,
-                  },
+        const response: GenerateContentResponse = await generateForensicContent(ai, {
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: normalizedMime,
+                  data: base64Data,
                 },
-                {
-                  text: `Perform an audio deepfake, neural voice-cloning, and synthetic speech forensic analysis on this audio recording (total duration: ${durationSec.toFixed(1)} seconds).
+              },
+              {
+                text: `Perform an audio deepfake, neural voice-cloning, and synthetic speech forensic analysis on this audio recording (total duration: ${durationSec.toFixed(1)} seconds).
 Inspect acoustic biomarkers including: pitch/prosody naturalness, vocoder metallic buzzing or phase artifacts, breathing and micro-pause cadence, harmonic overtone continuity, splicing boundaries, and background noise floor consistency.
 Divide the ${durationSec.toFixed(1)}s timeline into 5 to 8 consecutive non-overlapping segments covering 0 to ${durationSec.toFixed(1)} seconds, each with startSec, endSec, label, aiProbability (0-100), status ("Suspicious", "Borderline", or "Natural"), and forensic note.`,
+              },
+            ],
+          },
+          systemInstruction:
+            "You are an expert acoustic forensics analyzer specializing in synthetic speech, TTS vocoder artifacts, and voice-cloning deepfake detection. Return calibrated, objective structured JSON.",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              aiGeneratedPercent: { type: Type.NUMBER },
+              confidenceScore: { type: Type.NUMBER },
+              summary: { type: Type.STRING },
+              segments: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    startSec: { type: Type.NUMBER },
+                    endSec: { type: Type.NUMBER },
+                    label: { type: Type.STRING },
+                    aiProbability: { type: Type.NUMBER },
+                    status: { type: Type.STRING, description: "Suspicious, Borderline, or Natural" },
+                    note: { type: Type.STRING },
+                  },
+                  required: ["startSec", "endSec", "label", "aiProbability", "status", "note"],
                 },
-              ],
-            },
-            config: {
-              systemInstruction:
-                "You are an expert acoustic forensics analyzer specializing in synthetic speech, TTS vocoder artifacts, and voice-cloning deepfake detection. Return calibrated, objective structured JSON.",
-              responseMimeType: "application/json",
-              responseSchema: {
+              },
+              artifacts: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    category: { type: Type.STRING },
+                    severity: { type: Type.STRING },
+                    observation: { type: Type.STRING },
+                  },
+                  required: ["category", "severity", "observation"],
+                },
+              },
+              signals: {
                 type: Type.OBJECT,
                 properties: {
-                  aiGeneratedPercent: { type: Type.NUMBER },
-                  confidenceScore: { type: Type.NUMBER },
-                  summary: { type: Type.STRING },
-                  segments: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        startSec: { type: Type.NUMBER },
-                        endSec: { type: Type.NUMBER },
-                        label: { type: Type.STRING },
-                        aiProbability: { type: Type.NUMBER },
-                        status: { type: Type.STRING, description: "Suspicious, Borderline, or Natural" },
-                        note: { type: Type.STRING },
-                      },
-                      required: ["startSec", "endSec", "label", "aiProbability", "status", "note"],
-                    },
-                  },
-                  artifacts: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        category: { type: Type.STRING },
-                        severity: { type: Type.STRING },
-                        observation: { type: Type.STRING },
-                      },
-                      required: ["category", "severity", "observation"],
-                    },
-                  },
-                  signals: {
-                    type: Type.OBJECT,
-                    properties: {
-                      prosodyNaturalness: { type: Type.NUMBER },
-                      spectralContinuity: { type: Type.NUMBER },
-                      breathingPatterns: { type: Type.NUMBER },
-                      noiseFloorConsistency: { type: Type.NUMBER },
-                    },
-                    required: [
-                      "prosodyNaturalness",
-                      "spectralContinuity",
-                      "breathingPatterns",
-                      "noiseFloorConsistency",
-                    ],
-                  },
+                  prosodyNaturalness: { type: Type.NUMBER },
+                  spectralContinuity: { type: Type.NUMBER },
+                  breathingPatterns: { type: Type.NUMBER },
+                  noiseFloorConsistency: { type: Type.NUMBER },
                 },
                 required: [
-                  "aiGeneratedPercent",
-                  "confidenceScore",
-                  "summary",
-                  "segments",
-                  "artifacts",
-                  "signals",
+                  "prosodyNaturalness",
+                  "spectralContinuity",
+                  "breathingPatterns",
+                  "noiseFloorConsistency",
                 ],
               },
             },
-          })
-        );
+            required: [
+              "aiGeneratedPercent",
+              "confidenceScore",
+              "summary",
+              "segments",
+              "artifacts",
+              "signals",
+            ],
+          },
+        });
 
         const parsed = parseGeminiJson(response.text);
         const signals = (parsed.signals ?? {}) as Record<string, unknown>;
@@ -424,7 +560,7 @@ Divide the ${durationSec.toFixed(1)}s timeline into 5 to 8 consecutive non-overl
           };
         });
 
-        res.json({
+        const result = {
           aiGeneratedPercent,
           authenticPercent,
           confidenceScore,
@@ -448,7 +584,10 @@ Divide the ${durationSec.toFixed(1)}s timeline into 5 to 8 consecutive non-overl
             breathingPatterns: clamp(Number(signals.breathingPatterns ?? 50), 0, 100),
             noiseFloorConsistency: clamp(Number(signals.noiseFloorConsistency ?? 50), 0, 100),
           },
-        });
+        };
+
+        setCachedAnalysis(cacheKey, result);
+        res.json(result);
       } catch (err) {
         const { status, message } = parseApiError(err);
         res.status(status).json({ error: message });
@@ -472,6 +611,16 @@ Divide the ${durationSec.toFixed(1)}s timeline into 5 to 8 consecutive non-overl
 
         const durationSec = Math.max(1, Number(req.body?.durationSec) || files.length);
         const threshold = clamp(Number(req.body?.threshold ?? 50), 10, 90);
+        const cacheKey = hashBuffers(
+          `vid:${threshold}:${durationSec.toFixed(1)}:`,
+          files.map((f) => f.buffer)
+        );
+        const cached = getCachedAnalysis(cacheKey);
+        if (cached) {
+          res.json(cached);
+          return;
+        }
+
         let timestamps: number[] = [];
         try {
           timestamps = JSON.parse(String(req.body?.timestamps || "[]"));
@@ -501,89 +650,83 @@ Inspect face-swap boundary blending, jawline flickering, unnatural eye-blinking 
 Return an entry in frameAnalyses for EVERY frame index from 0 to ${files.length - 1}, including its aiProbability (0-100), status ("Suspicious", "Borderline", or "Natural"), forensic note, and 1 to 3 spatial heatmapRegions (normalized 0-100 coordinates x, y, width, height, intensity, label, reason) marking the inspected areas on that frame.`,
         });
 
-        const response: GenerateContentResponse = await callWithRetry(() =>
-          ai.models.generateContent({
-            model: MODEL_NAME,
-            contents: { parts },
-            config: {
-              systemInstruction:
-                "You are an expert spatio-temporal video deepfake forensics engine. Analyze every frame carefully for temporal inconsistencies and generative synthesis artifacts. Return strictly valid JSON.",
-              responseMimeType: "application/json",
-              responseSchema: {
+        const response: GenerateContentResponse = await generateForensicContent(ai, {
+          contents: { parts },
+          systemInstruction:
+            "You are an expert spatio-temporal video deepfake forensics engine. Analyze every frame carefully for temporal inconsistencies and generative synthesis artifacts. Return strictly valid JSON.",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              aiGeneratedPercent: { type: Type.NUMBER },
+              confidenceScore: { type: Type.NUMBER },
+              summary: { type: Type.STRING },
+              frameAnalyses: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    frameIndex: { type: Type.INTEGER },
+                    aiProbability: { type: Type.NUMBER },
+                    status: { type: Type.STRING },
+                    note: { type: Type.STRING },
+                    heatmapRegions: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          label: { type: Type.STRING },
+                          x: { type: Type.NUMBER },
+                          y: { type: Type.NUMBER },
+                          width: { type: Type.NUMBER },
+                          height: { type: Type.NUMBER },
+                          intensity: { type: Type.NUMBER },
+                          reason: { type: Type.STRING },
+                        },
+                        required: ["label", "x", "y", "width", "height", "intensity", "reason"],
+                      },
+                    },
+                  },
+                  required: ["frameIndex", "aiProbability", "status", "note", "heatmapRegions"],
+                },
+              },
+              artifacts: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    category: { type: Type.STRING },
+                    severity: { type: Type.STRING },
+                    observation: { type: Type.STRING },
+                  },
+                  required: ["category", "severity", "observation"],
+                },
+              },
+              signals: {
                 type: Type.OBJECT,
                 properties: {
-                  aiGeneratedPercent: { type: Type.NUMBER },
-                  confidenceScore: { type: Type.NUMBER },
-                  summary: { type: Type.STRING },
-                  frameAnalyses: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        frameIndex: { type: Type.INTEGER },
-                        aiProbability: { type: Type.NUMBER },
-                        status: { type: Type.STRING },
-                        note: { type: Type.STRING },
-                        heatmapRegions: {
-                          type: Type.ARRAY,
-                          items: {
-                            type: Type.OBJECT,
-                            properties: {
-                              label: { type: Type.STRING },
-                              x: { type: Type.NUMBER },
-                              y: { type: Type.NUMBER },
-                              width: { type: Type.NUMBER },
-                              height: { type: Type.NUMBER },
-                              intensity: { type: Type.NUMBER },
-                              reason: { type: Type.STRING },
-                            },
-                            required: ["label", "x", "y", "width", "height", "intensity", "reason"],
-                          },
-                        },
-                      },
-                      required: ["frameIndex", "aiProbability", "status", "note", "heatmapRegions"],
-                    },
-                  },
-                  artifacts: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        category: { type: Type.STRING },
-                        severity: { type: Type.STRING },
-                        observation: { type: Type.STRING },
-                      },
-                      required: ["category", "severity", "observation"],
-                    },
-                  },
-                  signals: {
-                    type: Type.OBJECT,
-                    properties: {
-                      lipSyncCoherence: { type: Type.NUMBER },
-                      blinkNaturalness: { type: Type.NUMBER },
-                      temporalStability: { type: Type.NUMBER },
-                      lightingContinuity: { type: Type.NUMBER },
-                    },
-                    required: [
-                      "lipSyncCoherence",
-                      "blinkNaturalness",
-                      "temporalStability",
-                      "lightingContinuity",
-                    ],
-                  },
+                  lipSyncCoherence: { type: Type.NUMBER },
+                  blinkNaturalness: { type: Type.NUMBER },
+                  temporalStability: { type: Type.NUMBER },
+                  lightingContinuity: { type: Type.NUMBER },
                 },
                 required: [
-                  "aiGeneratedPercent",
-                  "confidenceScore",
-                  "summary",
-                  "frameAnalyses",
-                  "artifacts",
-                  "signals",
+                  "lipSyncCoherence",
+                  "blinkNaturalness",
+                  "temporalStability",
+                  "lightingContinuity",
                 ],
               },
             },
-          })
-        );
+            required: [
+              "aiGeneratedPercent",
+              "confidenceScore",
+              "summary",
+              "frameAnalyses",
+              "artifacts",
+              "signals",
+            ],
+          },
+        });
 
         const parsed = parseGeminiJson(response.text);
         const signals = (parsed.signals ?? {}) as Record<string, unknown>;
@@ -633,7 +776,7 @@ Return an entry in frameAnalyses for EVERY frame index from 0 to ${files.length 
           };
         });
 
-        res.json({
+        const result = {
           aiGeneratedPercent,
           authenticPercent,
           confidenceScore,
@@ -658,7 +801,10 @@ Return an entry in frameAnalyses for EVERY frame index from 0 to ${files.length 
             temporalStability: clamp(Number(signals.temporalStability ?? 50), 0, 100),
             lightingContinuity: clamp(Number(signals.lightingContinuity ?? 50), 0, 100),
           },
-        });
+        };
+
+        setCachedAnalysis(cacheKey, result);
+        res.json(result);
       } catch (err) {
         const { status, message } = parseApiError(err);
         res.status(status).json({ error: message });
